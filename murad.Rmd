@@ -1,0 +1,323 @@
+---
+title: "murad"
+author: "Arvind S. Kumar"
+date: "15/11/2020"
+output:
+  pdf_document: default
+  html_document: default
+editor_options:
+  chunk_output_type: inline
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+# user settings
+options(digits=4)
+rm(list=ls())
+
+library(DOS2)
+library(optmatch)
+library(RItools)
+library(plyr)
+library(rcbalance)
+library(ggplot2)
+library(sensitivitymult)
+library(MatchIt)
+
+library("tidyverse")
+library("dplyr")
+library("haven")
+library("sjmisc")
+
+
+library(gridExtra)
+
+################################################
+##              helper functions              ##
+################################################
+
+# function to summarize matches 
+summarize.match <- function(dat, ms, ps.name="prop") {
+    adat <- dat
+    adat$pair <- ms
+    adat <- adat[!is.na(adat$pair),]
+    adat.treat <- adat[adat$media_type==1, ]
+    adat.ctrl <- adat[adat$media_type==0, ]
+
+    adat.m <- merge(adat.treat, adat.ctrl, by="pair", suffixes=c(".1", ".0"))
+    adat.m <- adat.m[, -which(names(adat.m) %in% c("media_type.1", "media_type.0", "pair"))]
+    adat.m <- adat.m[, sort(names(adat.m), index.return=TRUE)$ix]
+    
+    p0.name <- paste0(ps.name,".", 0)
+    p1.name <- paste0(ps.name,".",1)
+
+    adat.m.tmp.1 <- adat.m[, -which(names(adat.m) %in% c(p0.name, p1.name))]
+    adat.m.tmp.2 <- adat.m[, c(p0.name, p1.name)]
+
+    adat.m <- cbind(adat.m.tmp.1, adat.m.tmp.2)
+    
+    return(adat.m)
+}
+
+
+## preprocesses the results of pair matching for an analysis
+## using `senm'.
+cast.senm <- function(dat, ms.arg, y_field, z_field, two.outcomes=FALSE) {
+    ms <- as.vector(ms.arg)
+
+    y <- dat[!is.na(ms), y_field]
+    mset <- ms[!is.na(ms)]
+    z <- dat[!is.na(ms), z_field]
+    
+    dico.names <- unique(mset)
+    dico <- seq(length(dico.names))
+    names(dico) <- dico.names
+    mset <- as.integer(dico[mset])
+
+    if(two.outcomes==FALSE) {
+        return(list(y=y, mset=mset, z=z))
+    } else {
+        y2 <- dat$y2[!is.na(ms)]
+        return(list(y=y, y2=y2, mset=mset, z=z))
+    }
+}
+
+# compute t-test between media_type==1 and media_type==0
+media_type_t_test <- function(input_df, input_field){
+  t_test_obj <- t.test(input_df[input_df$media_type==1, input_field], input_df[input_df$media_type==0, input_field])
+  cat( "Point Estimate: ", t_test_obj$estimate[[1]] - t_test_obj$estimate[[2]], "\n")
+  return( t_test_obj )
+}
+
+
+```
+
+
+## Basic data analysis - similar to homework 3
+
+
+```{r}
+
+dta <- read_csv("/Users/arvind/Documents/Documents/Stanford/Winter21/humanai/data/causal_notext.csv")
+names(dta) <- tolower(names(dta))
+
+```
+
+```{r}
+# handcrafted variables, target variables list
+sped_var <- c("media_type") # indicator of whether received special education 
+
+handcraft_var <- c(
+"link",
+"campaign",
+"messenger",
+"start_month",
+"gender",
+"ret_pro"
+)
+
+# same as above with media_type
+important_var <- c(
+"link",
+"campaign",
+"messenger",
+"start_month",
+"gender",
+"ret_pro",
+"media_type"
+)
+
+tgt_var <- c("ctr"
+)
+
+
+all_vars <- append(append(sped_var, handcraft_var),tgt_var)
+
+df <- data.frame(dta[,all_vars])
+df <- as.data.frame.matrix(df)
+```
+
+```{r}
+# pre-process data
+
+# remove those that don't have y values.
+df <- subset(df, !is.na("ctr"))
+df <- subset(df, !is.na("ctr"))
+
+```
+# Part 1 Matching
+
+For each method, we have some visualizations of matching by plotting p-score.
+We also perform inference and compare with baselines.
+
+```{r}
+# fit a glm and add a column containing p-scores
+# since we are uing glm, we remove all nas
+df_no_na <- na.omit(df)
+rownames(df_no_na) <- 1:nrow(df_no_na)
+fit <- glm(media_type ~ . -ctr, family = binomial(), data = df_no_na)
+
+df_no_na$prop <- fit$fitted.values
+```
+
+## method 0: baselines t-test, ols
+### baseline t-test
+```{r}
+print("Math")
+# with(df_no_na, t.test(ctr ~ media_type))
+media_type_t_test(df_no_na, "ctr")
+
+```
+
+### baseline ols (no covariates) - SHOULD MATCH T-TEST
+```{r}
+no_covar_ols_math <- lm(ctr ~ media_type, data = df_no_na)
+print("Math")
+summary(no_covar_ols_math)
+
+```
+
+### baseline ols (with covariates)
+```{r}
+math_covariate_fmla <- as.formula(paste("ctr ~ ", paste(append(sped_var, handcraft_var), collapse= "+")))
+
+print("Math")
+covar_ols_math <- lm(math_covariate_fmla, data = df_no_na)
+# summary(covar_ols_math)
+round(summary(covar_ols_math)$coefficients[c("media_type"), ], 2)
+```
+
+## method 1: nearest neighbor matching (from paper)
+```{r}
+fmla <- as.formula(paste("media_type ~ ", paste(handcraft_var, collapse= "+")))
+
+ms.1 =  pairmatch(match_on(glm(fmla,data = df_no_na,family = binomial())), data=df_no_na)
+
+#plot(xBalance(media_type ~ . -prop -ctr -c5r2rscl + strata(ms.1) - 1, data =  df_no_na),main="Covariate balance with nearest neighbors")
+df_imp <- subset(df_no_na, select=important_var)
+plot(xBalance(media_type ~ . + strata(ms.1) - 1, data =  df_imp),main="Covariate balance with nearest neighbors")
+
+summ.1 <- summarize.match(df_no_na,ms.1)
+abs_diff.1 = abs(summ.1$prop.1 - summ.1$prop.0)
+cat("Mean absolute diff in prop scores after nearest neighbor matching = ",mean(abs_diff.1), "\n" )
+cat("Max absolute diff in prop scores after nearest neighbor matching  = ",max(abs_diff.1) )
+
+```
+
+```{r}
+# compute att and test difference in means
+
+df_nn_match = cbind(df_no_na, ms.1)
+df_nn_match = na.omit(df_nn_match)
+
+print("Math")
+media_type_t_test(df_nn_match, "ctr")
+
+# viz
+# here, I plot for the variables the paper claims as important
+ggplot(data=df_nn_match, aes(x=prop, group=as.factor(media_type), fill=as.factor(media_type))) + geom_density(alpha=1) + theme_bw()
+
+
+```
+
+
+## method 3: mahalanobis (ours)
+
+```{r}
+mat.2 <- smahal(df_no_na$media_type, subset(df_no_na, select=c(-media_type, -ctr, -prop)))
+ms.2 <- pairmatch(mat.2, data = df_no_na)
+#plot(xBalance(media_type ~ . -prop -ctr -c5r2rscl + strata(ms.2) - 1, data=df_no_na),main="Balance with Mahalanobis matching")
+
+df_imp <- subset(df_no_na, select=important_var)
+plot(xBalance(media_type ~ . + strata(ms.2) - 1, data =  df_imp),main="Balance with Mahalanobis matching")
+
+summ.2 <- summarize.match(df_no_na, ms.2)
+abs_diff.2 = abs(summ.2$prop.1 - summ.2$prop.0)
+cat("Mean absolute diff in prop scores before caliper = ",mean(abs_diff.2), "\n" )
+cat("Max absolute diff in prop scores before caliper = ",max(abs_diff.2) )
+
+df_mahalobnis <- cbind(df_no_na, ms.2)
+df_mahalobnis <- na.omit(df_mahalobnis)
+
+print("Math")
+media_type_t_test(df_mahalobnis, "ctr")
+
+```
+
+
+
+### method 3a: calipers
+
+```{r}
+mat.3 <- addcaliper(mat.2, z=df_no_na$media_type, p=df_no_na$prop, caliper=0.1)
+ms.3 <- pairmatch(mat.3, data=df_no_na)
+#plot(xBalance(media_type ~ . -prop -ctr -c5r2rscl + strata(ms.3) - 1, data=df_no_na),main="Balance with Mahalanobis matching after caliper")
+
+df_imp <- subset(df_no_na, select=important_var)
+plot(xBalance(media_type ~ . + strata(ms.3) - 1, data =  df_imp),main="Balance with Mahalanobis matching after caliper")
+
+summ.3 <- summarize.match(df_no_na,ms.3)
+abs_diff.3 = abs(summ.3$prop.1 - summ.3$prop.0)
+cat("Mean absolute diff in prop scores after caliper = ",mean(abs_diff.3), "\n" )
+cat("Max absolute diff in prop scores after caliper = ",max(abs_diff.3) )
+
+df_caliper <- cbind(df_no_na, ms.3)
+df_caliper <- na.omit(df_caliper)
+
+print("Math")
+media_type_t_test(df_caliper, "ctr")
+
+```
+
+
+### method 3b: exact matching on disability status
+
+```{r}
+mat.4 <- addalmostexact(mat.3, z=df_no_na$media_type, f=df_no_na$ret_pro, mult=5)
+ms.4 <- pairmatch(mat.4, data=df_no_na)
+#plot(xBalance(media_type ~ . -prop -ctr -c5r2rscl + strata(ms.4) - 1, data=df_no_na),main="Balance after exact matching on disability status")
+
+df_imp <- subset(df_no_na, select=important_var)
+plot(xBalance(media_type ~ . + strata(ms.4) - 1, data =  df_imp),main="Balance after exact matching on disability status")
+
+summ.4 <- summarize.match(df_no_na,ms.4)
+abs_diff.4 = abs(summ.4$prop.1 - summ.4$prop.0)
+cat("Mean absolute diff in prop scores after exact matching on ret_pro status = ",mean(abs_diff.4), "\n" )
+cat("Max absolute diff in prop scores after exact matching on ret_pro status = ",max(abs_diff.4))
+
+df_almostexact <- cbind(df_no_na, ms.4)
+df_almostexact <- na.omit(df_almostexact)
+
+print("Math")
+media_type_t_test(df_almostexact, "ctr")
+
+```
+
+
+# Part 2: Sensitivity
+
+## Run sensitivity with Paper / NN-matching
+### Math
+```{r}
+preproc_nn_match_math <- cast.senm(dat=df_no_na, ms.arg=ms.1, y_field="ctr", z_field="media_type")
+senm(y=preproc_nn_match_math$y, z=preproc_nn_match_math$z, mset=preproc_nn_match_math$mset, gamma=2.02, inner=0, trim=Inf, alternative="less")
+```
+
+## Run Sensitivity on Caliper + Mahalobnis
+### Math
+```{r}
+preproc_caliper_match_math <- cast.senm(dat=df_no_na, ms.arg=ms.3, y_field="ctr", z_field="media_type")
+senm(y=preproc_caliper_match_math$y, z=preproc_caliper_match_math$z, mset=preproc_caliper_match_math$mset, gamma=2.5, inner=0, trim=Inf, alternative="less")
+```
+
+
+## Run Sensitivity on Exact Match
+### Math
+```{r}
+preproc_exact_match_math <- cast.senm(dat=df_no_na, ms.arg=ms.4, y_field="ctr", z_field="media_type")
+senm(y=preproc_exact_match_math$y, z=preproc_exact_match_math$z, mset=preproc_exact_match_math$mset, gamma=2.67, inner=0, trim=Inf, alternative="less")
+```
+
+
+
